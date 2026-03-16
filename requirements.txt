@@ -1,0 +1,8 @@
+torch>=1.10.0
+torchvision>=0.11.1
+numpy
+Pillow
+opencv-python
+scikit-image
+tqdm
+gradio>=4.0.0
