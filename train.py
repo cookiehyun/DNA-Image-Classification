@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
-from src.model import Classifier
-from src.data import get_train_transform, BalancedClassSampler
+from src.model import Classifier, compute_prototypes
+from src.data import get_train_transform, get_eval_transform, BalancedClassSampler
 
 
 # Default layer-wise learning rates (from hyperparameter search).
@@ -140,6 +140,16 @@ def train(args):
     with open(meta_path, "w") as f:
         f.write("\n".join(class_names))
     print(f"Class names saved to {meta_path}")
+
+    # Compute and save class prototypes for cosine-similarity OOD.
+    model.eval()
+    eval_ds = ImageFolder(root=args.data_root, transform=get_eval_transform(args.image_size))
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
+                             shuffle=False, num_workers=min(8, os.cpu_count() or 1))
+    prototypes, train_sim = compute_prototypes(model, eval_loader, len(class_names), device)
+    proto_path = os.path.join(args.output_dir, f"prototypes_{timestamp}.pt")
+    torch.save({"prototypes": prototypes, "train_sim": train_sim}, proto_path)
+    print(f"Prototypes saved to {proto_path}")
 
     return model_path
 

@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
-from src.model import Classifier
+from src.model import Classifier, compute_prototypes, cosine_ood_scores, percentile_threshold
 from src.data import (
     BalancedClassSampler,
     UnlabeledDataset,
@@ -323,17 +323,29 @@ def train_model(dataset_path, num_classes, gpu_str, progress=gr.Progress(track_t
             loss.backward()
             optimizer.step()
 
-    model_path = os.path.join(tempfile.mkdtemp(), f"model_{datetime.now():%Y%m%d_%H%M%S}.pth")
+    save_dir = tempfile.mkdtemp()
+    ts = f"{datetime.now():%Y%m%d_%H%M%S}"
+    model_path = os.path.join(save_dir, f"model_{ts}.pth")
     torch.save(m.state_dict(), model_path)
 
-    del model, dataloader, dataset, optimizer, criterion
+    # Compute and save prototypes for cosine OOD.
+    m.eval()
+    eval_ds = ImageFolder(root=dataset_path, transform=eval_transform)
+    eval_loader = DataLoader(eval_ds, batch_size=BATCH_SIZE, shuffle=False,
+                             num_workers=min(8, os.cpu_count() or 1))
+    prototypes, train_sim = compute_prototypes(m, eval_loader, num_classes, device)
+    proto_path = os.path.join(save_dir, f"prototypes_{ts}.pt")
+    torch.save({"prototypes": prototypes, "train_sim": train_sim}, proto_path)
+
+    del model, dataloader, dataset, optimizer, criterion, eval_ds, eval_loader
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-    return model_path
+    return model_path, proto_path
 
 
 def run_inference(model_path, class_names, data_root, confidence_threshold, gpu_str,
+                  ood_method="softmax", proto_path=None,
                   progress=gr.Progress(track_tqdm=True)):
     if not data_root or not os.path.isdir(data_root):
         raise gr.Error("Please provide a valid image directory.")
@@ -345,6 +357,20 @@ def run_inference(model_path, class_names, data_root, confidence_threshold, gpu_
     if use_dp and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
     model.eval()
+
+    # Load prototypes for cosine OOD.
+    prototypes = None
+    train_sim = None
+    if ood_method == "cosine":
+        if proto_path and os.path.exists(proto_path):
+            data = torch.load(proto_path, map_location="cpu")
+            if isinstance(data, dict):
+                prototypes = data["prototypes"]
+                train_sim = data.get("train_sim")
+            else:
+                prototypes = data  # legacy: bare tensor
+        else:
+            raise gr.Error("Cosine OOD requires prototypes. Train a model first.")
 
     paths = sorted([
         p for p in glob.glob(os.path.join(data_root, "**", "*.*"), recursive=True)
@@ -359,13 +385,30 @@ def run_inference(model_path, class_names, data_root, confidence_threshold, gpu_
 
     results = {n: [] for n in class_names}
     results["OOD"] = []
-    threshold = confidence_threshold / 100.0
+
+    m = model.module if isinstance(model, nn.DataParallel) else model
+
+    # Determine threshold.
+    if ood_method == "cosine":
+        # Slider value is interpreted as percentile (0-100).
+        p = confidence_threshold
+        if train_sim is not None:
+            threshold = percentile_threshold(train_sim, p)
+        else:
+            threshold = p / 100.0  # fallback: use as raw fraction
+        threshold_display = f"percentile {p:.0f} (sim={threshold:.3f})"
+    else:
+        threshold = confidence_threshold / 100.0
+        threshold_display = f"{confidence_threshold:.0f}%"
 
     with torch.no_grad():
         for imgs, p_batch in tqdm(loader, desc="Inference"):
             imgs = imgs.to(device)
-            probs = torch.softmax(model(imgs), dim=1)
-            confs, preds = torch.max(probs, dim=1)
+            if ood_method == "cosine":
+                confs, preds = cosine_ood_scores(m, imgs, prototypes, device)
+            else:
+                probs = torch.softmax(model(imgs), dim=1)
+                confs, preds = torch.max(probs, dim=1)
             for i in range(len(p_batch)):
                 conf = confs[i].item()
                 pred_name = class_names[preds[i].item()]
@@ -375,9 +418,10 @@ def run_inference(model_path, class_names, data_root, confidence_threshold, gpu_
                     results[pred_name].append(p_batch[i])
 
     ood = results.get("OOD", [])
-    summary = "**Classification Results**\n" + "\n".join(
+    method_label = "Cosine similarity" if ood_method == "cosine" else "Softmax confidence"
+    summary = f"**Classification Results ({method_label})**\n" + "\n".join(
         f"- **{c}**: {len(ps)}" for c, ps in results.items()
-    ) + f"\n\n(Confidence threshold: {confidence_threshold}%)"
+    ) + f"\n\n(Threshold: {threshold_display})"
     status = f"Done. {len(paths)} images processed. OOD: {len(ood)}"
 
     del model, ds, loader
@@ -392,44 +436,58 @@ def run_inference(model_path, class_names, data_root, confidence_threshold, gpu_
 # ---------------------------------------------------------------------------
 
 def run_initial_training_and_eval(labeled_data, cropped_root, confidence, gpu,
+                                  ood_method="softmax",
                                   progress=gr.Progress(track_tqdm=True)):
     if len(labeled_data) < 2:
         raise gr.Error("At least 2 classes are required for training.")
     tmp_dir = tempfile.mkdtemp()
     create_tmp_dataset_folder(labeled_data, tmp_dir)
     names = sorted(labeled_data.keys())
-    model_path = train_model(tmp_dir, len(names), gpu, progress)
-    res, ood, status, summary = run_inference(model_path, names, cropped_root, confidence, gpu, progress)
+    model_path, proto_path = train_model(tmp_dir, len(names), gpu, progress)
+    res, ood, status, summary = run_inference(
+        model_path, names, cropped_root, confidence, gpu,
+        ood_method=ood_method, proto_path=proto_path, progress=progress,
+    )
     shutil.rmtree(tmp_dir)
-    return (model_path, res, ood, [], status,
+    return (model_path, proto_path, res, ood, [], status,
             gr.update(choices=sorted(res.keys())), summary,
             gr.update(value=model_path, visible=True))
 
 
 def run_retraining_and_eval(labeled_data, cropped_root, confidence, gpu,
+                            ood_method="softmax",
                             progress=gr.Progress(track_tqdm=True)):
     if len(labeled_data) < 2:
         raise gr.Error("At least 2 classes are required for training.")
     tmp_dir = tempfile.mkdtemp()
     create_tmp_dataset_folder(labeled_data, tmp_dir)
     names = sorted(labeled_data.keys())
-    model_path = train_model(tmp_dir, len(names), gpu, progress)
-    res, ood, _, summary = run_inference(model_path, names, cropped_root, confidence, gpu, progress)
+    model_path, proto_path = train_model(tmp_dir, len(names), gpu, progress)
+    res, ood, _, summary = run_inference(
+        model_path, names, cropped_root, confidence, gpu,
+        ood_method=ood_method, proto_path=proto_path, progress=progress,
+    )
     shutil.rmtree(tmp_dir)
-    return (model_path, res, ood, [], "Retraining complete.",
+    return (model_path, proto_path, res, ood, [], "Retraining complete.",
             gr.update(choices=sorted(res.keys())), summary,
             gr.update(value=model_path, visible=True))
 
 
-def run_inference_with_loaded_model(model_file, class_names_str, cropped_root,
-                                    confidence, gpu, progress=gr.Progress(track_tqdm=True)):
+def run_inference_with_loaded_model(model_file, proto_file, class_names_str,
+                                    cropped_root, confidence, gpu,
+                                    ood_method="softmax",
+                                    progress=gr.Progress(track_tqdm=True)):
     if not model_file:
         raise gr.Error("Please upload a model (.pth) file.")
     if not class_names_str:
         raise gr.Error("Please enter class names (comma-separated, same order as training).")
+    if ood_method == "cosine" and not proto_file:
+        raise gr.Error("Cosine OOD requires a prototypes (.pt) file.")
     names = [n.strip() for n in class_names_str.split(",")]
+    proto_path = proto_file.name if proto_file else None
     res, ood, status, summary = run_inference(
-        model_file.name, names, cropped_root, confidence, gpu, progress,
+        model_file.name, names, cropped_root, confidence, gpu,
+        ood_method=ood_method, proto_path=proto_path, progress=progress,
     )
     return res, ood, [], status, gr.update(choices=sorted(res.keys())), summary
 
@@ -481,6 +539,7 @@ def build_ui():
         state_temp_image_dir = gr.State(tempfile.mkdtemp(prefix="bordered_"))
         state_ood_images = gr.State([])
         state_model_path = gr.State(None)
+        state_proto_path = gr.State(None)
         state_results = gr.State({})
         state_full_image_paths = gr.State([])
         state_cropped_output_path = gr.State(None)
@@ -539,6 +598,11 @@ def build_ui():
                     with gr.Row():
                         with gr.Column(scale=1):
                             btn_train = gr.Button("Train + Infer", variant="primary")
+                            radio_ood = gr.Radio(
+                                ["softmax", "cosine"],
+                                value="softmax",
+                                label="OOD Detection Method",
+                            )
                             slider_conf = gr.Slider(minimum=0, maximum=100, value=96, step=1, label="OOD Threshold (%)")
                             md_train_status = gr.Markdown("Training status")
                         with gr.Column(scale=2):
@@ -562,6 +626,11 @@ def build_ui():
                     with gr.Row():
                         with gr.Column(scale=1):
                             btn_retrain = gr.Button("Retrain + Final Infer", variant="primary")
+                            radio_ood2 = gr.Radio(
+                                ["softmax", "cosine"],
+                                value="softmax",
+                                label="OOD Detection Method",
+                            )
                             slider_conf2 = gr.Slider(minimum=0, maximum=100, value=96, step=1, label="OOD Threshold (%)")
                             md_retrain_status = gr.Markdown("Retraining status")
 
@@ -585,6 +654,7 @@ def build_ui():
             with gr.Row():
                 with gr.Column():
                     file_model_upload = gr.File(label="Upload model (.pth)", type="filepath")
+                    file_proto_upload = gr.File(label="Upload prototypes (.pt, for cosine OOD)", type="filepath")
                     txt_model_classes = gr.Textbox(
                         label="Class names (same order as training, comma-separated)",
                         placeholder="ClassA,ClassB",
@@ -593,6 +663,11 @@ def build_ui():
                     if "Use GPU 0" in GPU_CHOICES:
                         default_gpu_load = "Use GPU 0"
                     dd_gpu_load = gr.Dropdown(choices=GPU_CHOICES, value=default_gpu_load, label="GPU")
+                    radio_ood_load = gr.Radio(
+                        ["softmax", "cosine"],
+                        value="softmax",
+                        label="OOD Detection Method",
+                    )
                     slider_conf_load = gr.Slider(minimum=0, maximum=100, value=96, step=1, label="OOD Threshold (%)")
                     btn_infer_loaded = gr.Button("Run Inference", variant="primary")
                     md_infer_status = gr.Markdown("Inference status")
@@ -639,12 +714,12 @@ def build_ui():
         )
 
         train_outputs = [
-            state_model_path, state_results, state_ood_images, gallery_ood,
+            state_model_path, state_proto_path, state_results, state_ood_images, gallery_ood,
             md_train_status, dd_result_class, md_summary, file_model_dl,
         ]
         btn_train.click(
             run_initial_training_and_eval,
-            [state_labeled_data, state_cropped_output_path, slider_conf, dd_gpu],
+            [state_labeled_data, state_cropped_output_path, slider_conf, dd_gpu, radio_ood],
             train_outputs,
         ).then(
             refresh_gallery_with_borders,
@@ -659,12 +734,12 @@ def build_ui():
         )
 
         retrain_outputs = [
-            state_model_path, state_results, state_ood_images, gallery_ood,
+            state_model_path, state_proto_path, state_results, state_ood_images, gallery_ood,
             md_retrain_status, dd_result_class, md_summary, file_model_dl,
         ]
         btn_retrain.click(
             run_retraining_and_eval,
-            [state_labeled_data, state_cropped_output_path, slider_conf2, dd_gpu],
+            [state_labeled_data, state_cropped_output_path, slider_conf2, dd_gpu, radio_ood2],
             retrain_outputs,
         )
 
@@ -674,7 +749,8 @@ def build_ui():
         infer_outputs = [state_results, state_ood_images, gallery_ood, md_infer_status, dd_result_class, md_summary]
         btn_infer_loaded.click(
             run_inference_with_loaded_model,
-            [file_model_upload, txt_model_classes, state_cropped_output_path, slider_conf_load, dd_gpu_load],
+            [file_model_upload, file_proto_upload, txt_model_classes,
+             state_cropped_output_path, slider_conf_load, dd_gpu_load, radio_ood_load],
             infer_outputs,
         ).then(
             refresh_gallery_with_borders,

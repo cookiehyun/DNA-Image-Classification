@@ -1,4 +1,4 @@
-from .model import Classifier, MLPHead
+from .model import Classifier, MLPHead, compute_prototypes, cosine_ood_scores, percentile_threshold
 from .data import (
     ResizeWithPad,
     UnlabeledDataset,

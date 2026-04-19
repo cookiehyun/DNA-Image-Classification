@@ -2,19 +2,21 @@
 
 Example usage::
 
-    # Classify images and save results
+    # Classify images and save results (softmax OOD, default)
     python inference.py \\
         --model_path ./checkpoints/model_20250101_120000.pth \\
         --classes_path ./checkpoints/classes_20250101_120000.txt \\
         --data_root ./data/test \\
         --output_dir ./results
 
-    # With OOD filtering
+    # With cosine-similarity OOD filtering
     python inference.py \\
         --model_path ./checkpoints/model.pth \\
         --classes_path ./checkpoints/classes.txt \\
+        --prototypes_path ./checkpoints/prototypes.pt \\
         --data_root ./data/test \\
-        --confidence_threshold 96
+        --ood_method cosine \\
+        --confidence_threshold 75
 """
 
 import argparse
@@ -27,7 +29,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.model import Classifier
+from src.model import Classifier, cosine_ood_scores, percentile_threshold
 from src.data import UnlabeledDataset, get_eval_transform
 
 
@@ -56,6 +58,22 @@ def run_inference(args):
     model.to(device)
     model.eval()
 
+    # Load prototypes (required for cosine OOD).
+    prototypes = None
+    train_sim = None
+    if args.ood_method == "cosine":
+        if not args.prototypes_path or not os.path.exists(args.prototypes_path):
+            raise FileNotFoundError(
+                "Cosine OOD requires --prototypes_path. "
+                "Run train.py first to generate prototypes."
+            )
+        data = torch.load(args.prototypes_path, map_location="cpu")
+        if isinstance(data, dict):
+            prototypes = data["prototypes"]
+            train_sim = data.get("train_sim")
+        else:
+            prototypes = data  # legacy: bare tensor
+
     # Collect image paths.
     paths = sorted([
         p for p in glob.glob(os.path.join(args.data_root, "**", "*.*"), recursive=True)
@@ -78,15 +96,30 @@ def run_inference(args):
         pin_memory=True,
     )
 
-    threshold = args.confidence_threshold / 100.0
+    # Determine threshold.
+    if args.ood_method == "cosine":
+        p = args.confidence_threshold
+        if train_sim is not None:
+            threshold = percentile_threshold(train_sim, p)
+            print(f"Cosine OOD: percentile {p:.0f} → threshold {threshold:.4f}")
+        else:
+            threshold = p / 100.0
+            print(f"Cosine OOD: raw threshold {threshold:.4f} (no train_sim available)")
+    else:
+        threshold = args.confidence_threshold / 100.0
+
     results = {name: [] for name in class_names}
     results["OOD"] = []
 
     with torch.no_grad():
         for imgs, batch_paths in tqdm(loader, desc="Inference"):
             imgs = imgs.to(device)
-            probs = torch.softmax(model(imgs), dim=1)
-            confs, preds = torch.max(probs, dim=1)
+
+            if args.ood_method == "cosine":
+                confs, preds = cosine_ood_scores(model, imgs, prototypes, device)
+            else:
+                probs = torch.softmax(model(imgs), dim=1)
+                confs, preds = torch.max(probs, dim=1)
 
             for i in range(len(batch_paths)):
                 conf = confs[i].item()
@@ -102,11 +135,12 @@ def run_inference(args):
                 else:
                     results[pred_name].append(path)
 
+    method_label = args.ood_method.capitalize()
     # Print summary.
-    print("\n--- Classification Results ---")
+    print(f"\n--- Classification Results ({method_label} OOD) ---")
     for cls in class_names:
         print(f"  {cls}: {len(results[cls])} images")
-    print(f"  OOD (conf < {args.confidence_threshold}%): {len(results['OOD'])} images")
+    print(f"  OOD ({method_label} < {args.confidence_threshold}%): {len(results['OOD'])} images")
 
     # Save results.
     os.makedirs(args.output_dir, exist_ok=True)
@@ -145,8 +179,15 @@ def parse_args():
     parser.add_argument("--data_root", type=str, required=True,
                         help="Path to images for classification")
     parser.add_argument("--output_dir", type=str, default="./results")
+    parser.add_argument("--ood_method", type=str, default="softmax",
+                        choices=["softmax", "cosine"],
+                        help="OOD detection method: 'softmax' or 'cosine'")
     parser.add_argument("--confidence_threshold", type=float, default=96.0,
-                        help="Confidence threshold for OOD detection (%%)")
+                        help="For softmax: confidence %% (default 96). "
+                             "For cosine: percentile of training similarities "
+                             "(default 7; lower = more conservative).")
+    parser.add_argument("--prototypes_path", type=str, default=None,
+                        help="Path to prototypes .pt file (required for cosine OOD)")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--gpu", type=int, default=None)
