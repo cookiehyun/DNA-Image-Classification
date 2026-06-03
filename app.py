@@ -513,7 +513,8 @@ def prepare_class_zip_download(class_name, results_dict):
         return None
     zip_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
     with zipfile.ZipFile(zip_path, "w") as zf:
-        for p in paths:
+        for item in paths:
+            p = item[0] if isinstance(item, (tuple, list)) else item  # OOD entries are (path, pred, conf) tuples
             zf.write(p, os.path.basename(p))
     gr.Info(f"Prepared {len(paths)} images from '{class_name}' as ZIP.")
     return zip_path
