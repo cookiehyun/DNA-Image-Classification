@@ -6,3 +6,9 @@ checkpoints/
 results/
 *.zip
 .env
+data/*
+!data/.gitkeep
+si_dataset/*
+!si_dataset/.gitkeep
+work/*
+!work/.gitkeep
